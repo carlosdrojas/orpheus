@@ -1,0 +1,3 @@
+mediapipe>=0.10,<1.0  # 1.0.x crashes in Metal helper on macOS
+opencv-python>=4.10
+numpy
