@@ -1,11 +1,14 @@
 # Orpheus — System Design
 
-Status: Draft v1 · Last updated 2026-10-26 · Owner: Carlos Rojas
+Status: Draft v2 · Last updated 2026-10-26 · Owner: Carlos Rojas
+v2: hardware scope switched to Kamsi Elele's chord-pose servo rig on the TI MSPM0G3507 (branch `air-guitar-poc-kamsi`).
 Supersedes `docs/software-design.md` (2026-09-28). Vision details and the CV review notes stay in `docs/vision-status.md` and `docs/vision-brief.md`.
 
 ## 1. Summary
 
-Orpheus turns hand movements into real guitar playing. A player holds a printed, neck-shaped board and plays it like a guitar. A webcam watches, and software turns the video into a stream of guitar events: which string is fretted at which fret, and when each string is plucked. Today that stream drives a software synth and MIDI. In the full system the same stream drives a microcontroller that moves **servos** to fret and pluck the strings of a real guitar.
+Orpheus turns hand movements into real guitar playing. A player holds a printed, neck-shaped board and plays it like a guitar. A webcam watches, and software turns the video into a stream of guitar events: which string is fretted at which fret, and when each string is plucked. Today that stream drives a software synth and MIDI. In the full system the same stream drives a **TI MSPM0G3507 LaunchPad** that moves a few **servos**: fret levers that press preset chord shapes, and a strum servo that sweeps a pick across the strings of a real guitar.
+
+The hardware plays **chords and strums**, not single notes. The host reduces note-level events from the board to "which chord pose, then strum down/up" (§8). Single-note playing stays available on the synth and MIDI.
 
 The main design rule is that **the event stream is the contract**:
 - Vision produces events and knows nothing about sound or hardware.
@@ -19,13 +22,13 @@ Each side can be built, tested and replaced on its own. Recorded event logs let 
 | Vision pipeline (camera → events) | `sw/` | Working prototype |
 | Audio outputs (synth, MIDI, JSONL log) | `sw/synth.py`, `--log` | Working |
 | Host-to-hardware bridge (`HardwareOut`, replayer) | `sw/` (planned) | Designed here (§8) |
-| Embedded controller + servo actuation | `hw/` (planned) | Designed here (§9); mechanical design still open |
+| Embedded controller + servo actuation (MSPM0, 2–4 servos) | `hw/` (planned); prototype firmware on Kamsi's branch (not yet pushed) | Designed here (§9); chord-pose mechanism still open |
 
 ## 2. Goals and non-goals
 
 **Goals**
 - Play recognisable guitar parts (open chords, strums, simple melodies) with no instrument in hand.
-- Drive a real guitar through servos from the same event stream, in real time.
+- Drive a real guitar from the same event stream in real time, with a small servo rig: chord-pose fretting plus one strum servo.
 - Gesture-to-sound latency under 150 ms end to end.
 - Run on a laptop with one webcam: no GPU, no training data needed to start.
 - Every stage testable offline: synthetic frames for vision, recorded logs for hardware.
@@ -35,6 +38,7 @@ Each side can be built, tested and replaced on its own. Recorded event logs let 
 - Studio-grade timing.
 - Techniques beyond fret, pluck and damp (no bends, slides, hammer-ons, vibrato).
 - Barre chords.
+- Single-note melodies or per-string plucking **on the hardware** (the synth still plays them).
 - Retraining hand-tracking models.
 
 ## 3. System overview
@@ -59,18 +63,17 @@ flowchart LR
     replay[replay.py] -.recorded log.-> hwo
   end
   subgraph Guitar["Servo guitar (hw/)"]
-    mcu[Microcontroller<br/>firmware] -->|I2C| pca[PCA9685<br/>PWM drivers]
-    pca --> fs[Fret servos]
-    pca --> ps[Pick servos]
-    pca --> ds[Damper servo]
-    fs & ps & ds --> strings[Guitar strings]
+    mcu[MSPM0G3507 LaunchPad<br/>firmware] -->|PWM 50 Hz| st[Strum servo]
+    mcu -->|PWM| fl[Fret levers A/B<br/>chord poses]
+    mcu -->|PWM| lift[Pick lift<br/>optional]
+    st & fl & lift --> strings[Guitar strings]
   end
   board -.seen by.-> cam
   hands -.seen by.-> cam
-  hwo -->|USB serial| mcu
+  hwo -->|USB serial<br/>XDS110 UART| mcu
 ```
 
-The host decides **what** to play. The microcontroller decides **when exactly** each servo moves: it handles fret-before-pluck ordering, servo timing, current limits and the safety watchdog.
+The host decides **what** to play: which chord pose, and when to strum which way. The microcontroller decides **how and exactly when** each servo moves: pose angles, waiting for the pose to settle before strumming, and the safety watchdog.
 
 ## 4. Physical board
 
@@ -169,181 +172,182 @@ class Output:
 
 ## 8. Host-to-hardware bridge
 
-### 8.1 `HardwareOut` (planned, `sw/hardware.py`)
+### 8.1 Two input modes, one event stream
 
-- It's one more `Output`, enabled with `--hw /dev/tty.usbmodem…`. The vision loop doesn't change beyond also calling `fret()` on fret events.
-- It turns events into serial lines (§9.4), sends a heartbeat every 100 ms, and sends `X` (all off) on quit, Ctrl-C, or hands lost for more than 1 s.
-- It rate-limits plucks per string (at most 15 Hz) so a jittery fingertip can't hammer a servo.
-- `--hw-dry-run` prints the serial lines instead of sending them, so the protocol can be tested with no device.
-- A reader thread logs MCU status (`S…`) and errors, and timestamps acks for latency measurement.
+The host can turn hands into events two ways. Both feed the same outputs.
 
-### 8.2 `replay.py` (planned)
+| Mode | Fretting input | Origin | What it produces |
+| --- | --- | --- | --- |
+| **Board** | Fingertips on the printed board's fret cells | `sw/` (this branch) | Per-string `fret` / `unfret`, per-string `pluck` |
+| **Sign** | Hand sign 1–7 picks a chord of the key | Kamsi's `air_guitar/` | One chord shape = a `fret` event per string, plus whole-chord strums |
 
-It reads a JSONL session and feeds it to any output at the recorded timing (`--speed 0.5` for slow motion). This is how the hardware is brought up and regression-tested without a camera. Recorded sessions (chords, fast strums, dropouts) become the shared test suite for both sides.
+Kamsi's chord table is already one fret per string (`G: [3, 2, 0, 0, 0, 3]`), so a sign-mode chord is exactly 6 board-mode `fret` events. Merging the two front-ends doesn't need a new event type. Kamsi's strum detector and position-based hand roles are planned to replace the equivalent parts of `guitar.py` / `air_guitar.py` (§12).
 
-### 8.3 Why USB serial
+### 8.2 `HardwareOut` (planned, `sw/hardware.py`)
 
-A USB CDC serial link is trivial on every candidate MCU, under 1 ms per message at 115200 baud, readable in any serial monitor, and carries status back. MIDI stays for audio monitoring; it has no clean way to express "hold fret" or return faults. A network link (ESP32 Wi-Fi) adds jitter and is only worth it if the guitar can't be cabled.
+The servo rig can only fret a fixed set of chord poses and strum all strings at once. `HardwareOut` is the one place that reduces events to that.
 
-## 9. Embedded system and servo actuation
+- **Chord matching.** It keeps the current fret per string, as `GuitarState.held` already does. When it changes, it looks for a pose with that exact shape in the shared pose table (§9.4). Strings a pose leaves unplayed (`None`) are ignored in the comparison.
+  - All strings open → the `open` pose.
+  - No match → keep the last pose and count a "no pose" miss, shown in `--diag`.
+  - A pose change is sent as `C<pose>` straight away, usually well before the strum arrives.
+- **Strum grouping.** Plucks arriving within 60 ms of each other in the same direction collapse into one strum: `D<v>` or `U<v>`, with `v` = the group's highest velocity × 127. A lone single-string pluck still triggers a whole-chord strum. That's the accepted limitation of this scope.
+- **Safety.** It sends a heartbeat `H` every 100 ms, and `R` (all to rest) on quit, on Ctrl-C, or when hands are lost for more than 1 s.
+- **Rate limit.** At most 8 strums/s, to protect the strum servo.
+- **Dry run.** `--hw-dry-run` prints the serial lines instead of sending them.
+- **Status reader.** A reader thread prints firmware lines (`PONG`, errors).
+- **Interface.** It implements `pluck`, `mute`, `fret` and `close` like every other output. It's enabled with `--hw /dev/tty.usbmodem…`.
 
-> **Status:** proposal. `hw/` is empty and the mechanical design isn't fixed. Servo counts, timings and currents below are planning numbers from typical hobby servos (SG90/MG90S class); confirm them against the datasheets for the parts actually chosen.
+### 8.3 `replay.py` (planned)
 
-### 9.1 Hardware architecture
+It reads a JSONL session and feeds it to any output at the recorded timing (`--speed 0.5` for slow motion). This is how the servo rig is brought up and regression-tested without a camera. Recorded sessions become the shared test suite for both input modes.
+
+### 8.4 Why USB serial
+
+The LaunchPad's XDS110 debugger exposes UART0 (PA10/PA11) as a USB serial port on the same cable used for flashing, so no extra hardware is needed. It runs at 115200 baud (well under 1 ms per command), is readable in any serial monitor, and reports back. MIDI stays for audio monitoring.
+
+## 9. Embedded system and servo actuation (MSPM0, chord poses)
+
+> **Status:** proposal, based on Kamsi's proof of concept. The README on `air-guitar-poc-kamsi` describes `firmware_mspm0/main.c` and `servo_console.py`, but they **aren't pushed yet**, so nothing below has been checked against real firmware. The chord-pose mechanism isn't designed yet.
+
+### 9.1 Hardware
 
 ```mermaid
 flowchart LR
-  usb[USB serial<br/>from host] --> mcu[MCU<br/>ESP32-S3 / Teensy / Arduino]
-  mcu -->|I2C 400 kHz| p1[PCA9685 #1<br/>16 ch]
-  mcu -->|I2C| p2[PCA9685 #2<br/>16 ch]
-  mcu -->|I2C| p3[PCA9685 #3<br/>16 ch]
-  p1 --> fA[Fret servos<br/>strings 0–2]
-  p2 --> fB[Fret servos<br/>strings 3–5]
-  p3 --> pk[6 pick servos]
-  p3 --> dm[Damper servo]
-  psu[5–6 V servo supply<br/>≥10 A] --> p1 & p2 & p3
-  mcu -.estop input.-> es[E-stop switch]
+  usb[USB from host] --> xds[XDS110 back-channel<br/>UART0 PA10/PA11]
+  xds --> mcu[MSPM0G3507]
+  mcu -->|PWM_0 C0| s0[Servo 0: strum]
+  mcu -->|PWM_0 C1| s1[Servo 1: fret lever A]
+  mcu -->|PWM_1 C0| s2[Servo 2: fret lever B<br/>optional]
+  mcu -->|PWM_1 C1| s3[Servo 3: pick lift<br/>optional]
+  psu[5–6 V servo supply<br/>≥1 A per moving servo] --> s0 & s1 & s2 & s3
 ```
 
-- **MCU:** any board with USB serial and I2C. An ESP32-S3 or Teensy 4.x gives headroom; an Arduino Uno/Nano also works for this command rate.
-- **PWM drivers:** PCA9685 16-channel boards on one I2C bus, so the MCU doesn't generate dozens of PWM signals itself. Three boards give 48 channels (37 used).
-- **Power:** servos run from a **separate 5–6 V supply**, never the MCU's USB 5 V, with a common ground. Use bulk capacitance (≥1000 µF) on each driver's servo rail, and fuse the supply.
+- **MCU:** TI LP-MSPM0G3507 LaunchPad, programmed with SysConfig + DriverLib in CCS.
+- **PWM:** two timer instances (`PWM_0`, `PWM_1`) at about 1 MHz tick, 20000-count period (50 Hz), edge-aligned, 2 channels each. The firmware reads the real period at runtime, so pulse widths stay correct if the clock setup changes.
+- **UART:** `UART_0`, 115200 8N1, with an RX interrupt.
+- **Power:**
+  - Servos run from a **separate 5–6 V supply**, never the LaunchPad's USB power.
+  - Budget about 1 A per servo moving at the same time.
+  - The supply's ground ties to a LaunchPad GND pin.
+- **Signal level:** MSPM0 pins are 3.3 V. Most hobby servos accept that; if one jitters, add a 3.3 → 5 V level shifter.
 
-### 9.2 Actuator mapping
+### 9.2 Actuators
 
-| Function | Actuators | Count | Mechanism |
-| --- | --- | --- | --- |
-| Fretting | One servo per (string, fret) cell | 6 × 5 = 30 | A servo horn or lever presses the string onto the fret and holds while fretted |
-| Picking | One servo per string | 6 | The horn carries a pick and rests on one side of the string. Moving to the other side plucks it. **Down vs up stroke = which side it moves to**, matching the event's `direction` |
-| Damping | One servo with a felt bar across all strings | 1 | Lowered briefly on `unfret` or `X`; optionally per string later |
+| Servo | Job | How |
+| --- | --- | --- |
+| 0: strum | Strums all strings | The horn carries a pick and rests on one side of the strings (`STRUM_SIDE_A_US`). Sweeping to the other side (`STRUM_SIDE_B_US`) strums. **Down vs up = which way it sweeps**, matching the event's direction |
+| 1: fret lever A | Holds a chord shape | Each lever angle presses a preset shape: a bar, cam or comb pressing several strings at once. One lever with N angles gives N poses |
+| 2: fret lever B (optional) | More chord shapes | A second lever multiplies the number of poses: pose = (angle A, angle B) |
+| 3: pick lift (optional) | Repositions without strumming | Lifts the pick so it can return to the right side silently |
 
-One servo per fret cell is the simplest mapping: every fret change is a single, independent move with no carriage to slide. Two cheaper alternatives, if 30 servos is too many:
-- one sliding fretter per string (6 actuators), which is much slower to change frets;
-- fewer frets.
+**Keeping strum direction in sync:** if two strums in a row go the same direction, the pick is on the wrong side for the second one. With a lift servo, the firmware lifts, returns and drops without sounding. Without one, it strums the other way instead, so the beat isn't lost. This is the behaviour Kamsi's README describes.
 
-Solenoids are the usual alternative for fretting, since they're faster and simpler to hold. The protocol in §9.4 doesn't change if the team switches.
+The old one-servo-per-fret-cell design (37 servos, 3 PCA9685 boards) is kept only as a **stretch goal**. It's the only way the hardware could play single notes.
 
-**Note selection:** on each string, the firmware lowers only the servo for the highest held fret, mirroring the host's "highest fret wins" rule. Releasing goes back to the rest angle.
+### 9.3 Firmware behaviour
 
-### 9.3 Firmware design
+- **Pose table:** `CHORD_POSE[pose] = {lever A µs, lever B µs}`. Calibrated angles are compiled into the firmware for now, set by jogging with `S<ch>,<us>` from `servo_console.py`.
+- **Ordering (proposed addition):** a strum that arrives while a pose change is still moving waits until the pose has settled, after a calibrated `POSE_SETTLE_MS` (about 80–150 ms for a lever). This keeps fret-before-strum on the MCU, where the timing is known.
+- **Velocity:** hobby servos move at one speed, so strum strength only affects the synth's volume. On the rig, `D<v>`/`U<v>` could later choose between two sweep endpoints (lighter or deeper pick contact).
+- **Watchdog (proposed addition):** no `H` and no other command for 500 ms → all servos to rest.
+- **Polarity check:** if the first servo slams to an end and buzzes, flip `CC_SETS_LOW_TIME` in `main.c` (per Kamsi's README).
 
-```mermaid
-flowchart TD
-  rx[Serial RX<br/>line parser] --> q[Command queue]
-  q --> st[Per-string state machine]
-  st --> sch[Scheduler<br/>time-ordered servo moves]
-  sch --> drv[PCA9685 writer]
-  wd[Watchdog<br/>heartbeat + e-stop] --> sch
-  cal[Calibration table<br/>EEPROM/flash] --> drv
-  st --> tx[Status TX]
-```
+### 9.4 Wire protocol (v1, shared)
 
-**Per-string state:** `held_fret`, `fret_ready_at` (time the fret servo is seated), `pick_side` (A/B), and `last_pluck_at`.
+This is Kamsi's protocol, with two proposed changes marked † that need Kamsi's agreement:
+- a heartbeat;
+- making `C` refer to a **fixed pose table** instead of "chord *i* of the current key/mode".
 
-Command handling:
-- **`F s f`:** raise the previous fret servo and lower the new one, with `fret_ready_at = now + t_seat` (calibrated, ~40–60 ms). `f = 0` just raises.
-- **`P s vel dir`:** if `now < fret_ready_at`, the strike is scheduled for `fret_ready_at`, so **fret-before-pluck ordering is enforced here, not on the host**. The pick servo moves to the side given by `dir`. If it's already on that side, it first returns without striking (a "reset" move); this is logged so the host side can tune strum detection.
-- **`M s`:** release the fret servo and pulse the damper (or a per-string damper later).
-- **Velocity:** hobby servos run at one speed, so v1 maps velocity only to whether a soft or hard pick travel endpoint is used. Real dynamics need a different mechanism and are a non-goal for v1.
-
-**Servo model:** hobby servos have no position feedback. "Seated" and "struck" are therefore **time-based**, using per-servo calibrated move times. Standard servos update at the 50 Hz PWM frame, adding up to 20 ms. Digital servos at 200–333 Hz cut that, and are recommended for the pick servos.
-
-**Calibration:** per channel, the rest angle, active angle and move time are stored in flash. They're set over serial (`C ch us` jogs a channel to a raw pulse width; `W` saves). This is needed because servo horns, mounting and string heights vary.
-
-**Thermal and current limits:**
-- A fret servo holding against string tension draws current continuously.
-- At most one fret servo per string is ever lowered, so at most 6 hold at once. The firmware enforces that cap, and releases any fret held more than 10 s without a refresh.
-- Pick servos get a minimum interval between strikes.
-
-### 9.4 Wire protocol (v1 proposal)
-
-ASCII, one command per line, `\n`-terminated, 115200 baud or more. An optional trailing `#seq` makes the MCU echo an ack for latency measurement.
+The second change matters because today index 0 means G in G major but D in D major, so the firmware would have to know the host's key and mode.
 
 | Host → MCU | Meaning |
 | --- | --- |
-| `F <string> <fret>` | Hold string at fret (0 = release) |
-| `P <string> <velocity 0–127> <dir ±1>` | Strike string |
-| `M <string>` | Release and damp string |
-| `X` | All off: release all frets, park picks, lower damper |
-| `H` | Heartbeat. With none for 500 ms, the MCU runs `X` itself |
-| `C <channel> <pulse_us>` / `W` | Calibration jog / save calibration |
-| `?` | Report firmware version and channel map |
+| `C<pose>` † | Move fret levers to pose `<pose>`, an index into the shared pose table below |
+| `D<v>` / `U<v>` | Strum down / up, strength 0–127 |
+| `S<ch>,<us>` | Raw pulse on servo channel (clamped 500–2500 µs), for calibration |
+| `R` | All servos to rest |
+| `P` | Ping; firmware answers `PONG` |
+| `H` † | Heartbeat; with nothing received for 500 ms the firmware runs `R` |
 
-| MCU → Host | Meaning |
-| --- | --- |
-| `OK <seq>` / `ERR <code> <seq>` | Ack, only when `#seq` was sent |
-| `S <bits> <active_frets> <temp>` | Status at 5 Hz: faults, e-stop, active servos |
+**Shared pose table** (†). One file, `poses.json`, read by the host and copied into the firmware's `CHORD_POSE` order:
 
-The host sends **intent**, never servo angles or timing. Everything mechanical lives in firmware, so changing servos or switching to solenoids never touches `sw/`.
+```json
+["open", "G", "C", "D", "Em", "Am"]
+```
+
+Each name refers to a fret shape in the host's chord table, e.g. `"G": [3, 2, 0, 0, 0, 3]`. The firmware stores only the lever angles for each pose. The list above is a placeholder, since the real one depends on which shapes the lever mechanism can press (§14). Sign mode maps a key's chord 1–7 to these names and sends the matching index; chords the rig can't press play on the synth only.
 
 ### 9.5 Safety
 
-- **Watchdog:** no heartbeat for 500 ms → `X`. A host crash or unplugged cable releases everything.
-- **Physical e-stop** cuts servo power directly, not through firmware.
-- **The firmware never trusts the host:** it enforces the strike-rate limits, the cap on active fret servos, and the hold timeout itself.
-- **Power-on state:** all servos at rest, with the damper down.
+- Watchdog plus heartbeat (†): a host crash or unplugged cable sends everything to rest.
+- `R` on quit, on Ctrl-C, and when hands are lost for more than 1 s.
+- The firmware clamps pulse widths to 500–2500 µs and enforces a minimum time between strums, without relying on the host.
+- A physical switch on the servo supply as the e-stop.
+- Power-on state: all servos at rest.
 
 ## 10. Latency budget (target under 150 ms, gesture to string)
 
 | Stage | Estimate | Notes |
 | --- | --- | --- |
-| Camera exposure + capture | ~30 ms | ~17 ms with a 60 fps camera |
+| Camera exposure + capture | ~17–30 ms | 60 fps request at 640×480 (Kamsi's settings) vs ~30 ms at the default |
 | MediaPipe inference | 15–25 ms | M1 Pro estimate; M5 not yet measured |
-| Board fit + event logic | < 2 ms | |
+| Event logic + strum grouping | < 2 ms | Grouping waits for the first pluck only; later plucks join the strum already sent |
 | Serial to MCU | < 1 ms | |
-| PWM frame wait | 0–20 ms | 3–5 ms with digital servos at 200–333 Hz |
-| Pick servo throw (~20°) | ~30–40 ms | SG90 class ≈ 0.1 s / 60°; faster servos help most here |
-| **Pluck total** | **~80–120 ms** | |
-| Fret seat | ~40–60 ms | Usually hidden: fret events arrive before the strum, and the MCU delays the pluck only if the fret isn't seated yet |
+| PWM frame wait | 0–20 ms | 50 Hz servo update |
+| Strum servo sweep | ~40–60 ms | Depends on the sweep angle and the servo |
+| **Strum total** | **~75–140 ms** | Kamsi's README estimates 70–120 ms motion → strike |
+| Pose change | ~80–150 ms | Usually hidden: chord changes come before the strum; the MCU waits only if the pose hasn't settled |
 
-Nothing in this table has been measured yet. Measuring host send time against MCU ack times (§8.1) and a slow-motion phone video of a strike against the strum gives the real numbers at milestone M4.
+Nothing here has been measured. A slow-motion phone video of the hand and the strum servo together gives the real figure at milestone M4.
 
 ## 11. Testing
 
 | Level | What | How |
 | --- | --- | --- |
-| Unit, vision | Board tracking with full, partial and mirrored marker views; legacy layout; event serialisation | `sw/test_board.py`: the real template is warped into synthetic frames with known ground truth (5/6 pass; `well_spread` TODO) |
-| Unit, logic | Fret debounce, string crossings, dead band | Synthetic fingertip tracks into `GuitarState` |
-| Live, vision | Tracking %, marker size, fps, hand roles, jitter | `air_guitar.py --diag --log sessionN.jsonl`; quit summary |
-| Protocol | Event → serial lines | `HardwareOut --hw-dry-run` against recorded logs |
-| Firmware | Parser, scheduler, watchdog | Host-side unit tests of the parser/scheduler logic; serial monitor scripts |
-| Hardware-in-the-loop | Strike and seat timing, ordering, rate limits | `replay.py` into one-string rig; ack timestamps; slow-motion video |
-| End to end | Scripted songs | "Play Em, strum down 4×" scored against the expected events |
+| Unit, vision | Board tracking with full, partial and mirrored marker views; legacy layout; event serialisation | `sw/test_board.py` (5/6 pass; `well_spread` TODO) |
+| Unit, gestures | Strum detection, sign reading, keys and voicings | Kamsi's `air_guitar/test_logic.py` (13/13 pass) |
+| Unit, bridge | Chord matching, strum grouping, rate limit, heartbeat | Planned `sw/test_hardware.py`: recorded events in, expected serial lines out |
+| Protocol | Events → serial lines | `HardwareOut --hw-dry-run` against recorded logs |
+| Firmware | Parser, pose table, watchdog, strum-direction sync | `servo_console.py` scripts against the LaunchPad |
+| Hardware-in-the-loop | Pose settle time, strum timing, ordering | `replay.py` into the rig; slow-motion video |
+| End to end | Scripted songs in both modes | "G C D Em, 4 down-strums each", scored against expected events and audio |
 
 ## 12. Current status and known limitations
 
-**Working:** 10-marker board tracking that survives partial occlusion; fret and pluck events with a dead band; synth, MIDI and JSONL outputs; diagnostics.
+**Working:** board tracking that survives partial occlusion; per-string fret and pluck events with a dead band; synth, MIDI and JSONL outputs; diagnostics. On Kamsi's branch: sign-mode chords, a tested strum detector, and the MSPM0 path described in its README.
 
 | Limitation | Cause | Planned fix |
 | --- | --- | --- |
-| Hovering fingers count as pressed | One camera, no reliable depth | Low side camera; then touch strips on the board or a learned press/hover classifier (`docs/vision-status.md`) |
-| Hand roles can swap | Relies on MediaPipe's Left/Right label | Assign roles by position on the board (nut side frets) |
-| Fit trusted from markers bunched at one end | `well_spread()` not written | Implement and tune (`min_markers`, RANSAC threshold) |
-| ~60–100 ms vision latency (estimated) | Camera, inference | 60 fps camera; crop to the board area |
-| Index-finger picking only; no barre chords | One tracked point / one cell per fingertip | Track more tips; chord-shape classifier |
-| No dynamics on the servo guitar | Hobby servos have fixed speed | Two-endpoint soft/hard stroke in v1; better mechanism later |
+| Hardware plays only the chord poses the levers can press, always strumming all strings | Scope choice: 2–4 servos | Accepted for this semester; per-cell fretting is the stretch goal |
+| Board shapes that match no pose don't change the hardware chord | Fixed pose table | `--diag` "no pose" count; add poses mechanically if often missed |
+| Hovering fingers count as pressed (board mode) | One camera, no reliable depth | Sign mode avoids it; side camera or touch strips for board mode |
+| Hand roles can swap (board mode) | Relies on MediaPipe's Left/Right label | Adopt Kamsi's position-based role assignment |
+| Strum detection is simpler than Kamsi's | No speed threshold or refractory period | Adopt `StrumDetector` ideas: hand-size-normalised speed, min speed, refractory period |
+| Fit trusted from markers bunched at one end | `well_spread()` not written | Implement and tune |
+| Firmware not in the repo | Not pushed with Kamsi's branch | Ask Kamsi to push `firmware_mspm0/` and `servo_console.py` |
 
 ## 13. Milestones
 
 | # | Milestone | Deliverable | State |
 | --- | --- | --- | --- |
-| M0 | Vision prototype | `sw/` webcam → events → synth | Done |
-| M1 | Physical board | Printed 10-marker board, diagnostics, first live sessions | In progress |
-| M2 | Freeze contract | Event v1 (§6) and wire protocol (§9.4) agreed with hardware | Next |
-| M3 | Replayer + dry run | `replay.py`, `HardwareOut --hw-dry-run` | Next, parallel with M4 |
-| M4 | One-string servo rig | 1 pick servo + 5 fret servos + firmware, driven from replay, then live; latency measured | Needs hardware |
-| M5 | Six-string servo guitar, live | Vision → servo guitar end to end | After M4 |
-| M6 | Accuracy pass | Press vs hover, hand-role fix, strum timing | After M5 findings |
+| M0 | Vision prototypes | Board mode (`sw/`) and sign mode (`air_guitar/`) | Done |
+| M1 | Physical board | Printed 10-marker board, diagnostics, live sessions | In progress |
+| M2 | Freeze contract | Event v1 (§6), wire protocol and `poses.json` (§9.4) agreed with Kamsi | Next |
+| M3 | Bridge + replay | `HardwareOut` (chord matching, strum grouping, heartbeat), `--hw-dry-run`, `replay.py`, tests | Next, parallel with M4 |
+| M4 | Strum-only rig | MSPM0 + strum servo driven from replay, then live; strum latency measured | Needs firmware pushed |
+| M5 | Chord-pose rig | Fret lever(s) with the first poses (e.g. open, G, C, D), both input modes live | After M4 |
+| M6 | Merge front-ends | One app with board and sign modes, shared strum detector and hand-role logic | After M5 |
 
-## 14. Open questions for the hardware side
+## 14. Open questions
 
-1. Servo models for fret and pick, with their real move times, stall currents and holding torque against string tension.
-2. Is 30 fret servos (one per cell) acceptable for mounting, cost and power, or is a per-string slider preferred?
-3. How many frets should the guitar cover? The board has 5; more frets means reprinting the board.
-4. One damper bar, or per-string dampers?
-5. MCU choice and how the servo supply is sized and fused.
-6. Is the pick-side-swap stroke mechanically reliable on every string, or does each string need a return move?
-7. Does board touch sensing (for press vs hover) share this MCU or get its own?
+1. **Lever mechanism:** what presses a chord shape (a bar, cam or comb), and how many poses can one or two levers reach?
+2. **Which chords get poses first?** G, C, D, Em cover the default progression in Kamsi's app.
+3. **Pick lift:** needed, or is reversing the strum when out of sync good enough?
+4. **Pose settle time and strum sweep time** of the chosen servos.
+5. Is Kamsi OK with the two protocol changes (fixed pose table, heartbeat)?
+6. **Repo layout:** keep `air_guitar/` and `sw/` side by side until M6, or merge sooner?
+7. **Where the firmware lives:** `hw/firmware_mspm0/` in this repo, or `air_guitar/firmware_mspm0/` as Kamsi's README has it?
 
 ## Appendix: repo layout and running
 
@@ -351,8 +355,8 @@ Nothing in this table has been measured yet. Measuring host send time against MC
 orpheus/
   README.md
   docs/   system-design.md (this) · vision-status.md · vision-brief.md · software-design.md (old)
-  sw/     vision + audio prototype (Python) — see sw/README.md
-  hw/     firmware + hardware (planned)
+  sw/     board-mode vision + audio prototype (Python) — see sw/README.md
+  hw/     firmware + hardware (planned; MSPM0 firmware currently on Kamsi's branch)
 ```
 
 ```bash

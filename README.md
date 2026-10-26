@@ -1,11 +1,11 @@
 # Orpheus
 
-Air guitar that plays a real guitar. Hold a printed, neck-shaped board and play it like a guitar. A webcam tracks your hands, software turns them into fret and pluck events, and those events drive a synth today and a servo-actuated guitar next.
+Air guitar that plays a real guitar. Hold a printed, neck-shaped board and play it like a guitar. A webcam tracks your hands, software turns them into fret and pluck events, and those events drive a synth today and, next, a small servo rig on a real guitar: fret levers that press chord shapes plus a strum servo, on a TI MSPM0G3507 LaunchPad.
 
 ```
 webcam → hand landmarks (MediaPipe) → board space (ArUco + homography) → fret / unfret / pluck events
                                                                            ├─ synth / MIDI / JSONL log   (working)
-                                                                           └─ USB serial → MCU → servos  (planned)
+                                                                           └─ USB serial → MSPM0 → chord-pose + strum servos  (planned)
 ```
 
 Senior design project, Fall 2026.
@@ -17,8 +17,8 @@ Senior design project, Fall 2026.
 | Vision prototype (`sw/`) | Working on a laptop webcam, 25–30 fps |
 | Printed board, 10-marker tracking | Built, in live testing |
 | Synth, MIDI, event log | Working |
-| Host-to-hardware bridge | Designed (`docs/system-design.md` §8) |
-| Firmware + servo guitar (`hw/`) | Designed (§9), mechanical design open |
+| Host-to-hardware bridge (chord matching, strum grouping) | Designed (`docs/system-design.md` §8) |
+| MSPM0 firmware + chord-pose servo rig | Designed (§9), based on Kamsi's proof of concept (branch `air-guitar-poc-kamsi`); lever mechanism open |
 
 ## Quick start
 
