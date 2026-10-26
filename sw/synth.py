@@ -32,9 +32,15 @@ class Synth:
         with self.lock:
             self.voices[string] = [buf, 0]
 
-    def mute(self, string):
+    def mute(self, string, fade_s=0.02):
+        """Damp a string with a short fade (a hard cut clicks)."""
         with self.lock:
-            self.voices[string] = None
+            voice = self.voices[string]
+            if voice is None:
+                return
+            buf, pos = voice
+            tail = buf[pos:pos + int(self.sr * fade_s)]
+            self.voices[string] = [tail * np.linspace(1, 0, len(tail), dtype=np.float32), 0]
 
     def _callback(self, out, frames, time_info, status):
         mix = np.zeros(frames, dtype=np.float32)
@@ -82,22 +88,43 @@ def karplus_strong(freq, sr, duration, velocity=0.8, decay=0.996):
 
 
 class MidiOut:
-    def __init__(self, port_name="orpheus", channel=0):
+    """Note-off is sent on re-pluck, on mute, or after `duration` seconds,
+    so sustained patches don't hang (matches the synth's ring time)."""
+
+    def __init__(self, port_name="orpheus", channel=0, duration=2.0):
         import mido
         self.mido = mido
         self.port = mido.open_output(port_name, virtual=True)
         self.channel = channel
-        self.sounding = [None] * NUM_STRINGS
+        self.duration = duration
+        self.sounding = [None] * NUM_STRINGS  # per string: (note, timer)
+        self.lock = threading.Lock()
 
     def pluck(self, string, midi_note, velocity=0.8):
-        self.mute(string)
-        self.port.send(self.mido.Message("note_on", note=midi_note,
-                                         velocity=int(1 + 126 * velocity), channel=self.channel))
-        self.sounding[string] = midi_note
+        with self.lock:
+            self._off(string)
+            self.port.send(self.mido.Message("note_on", note=midi_note,
+                                             velocity=int(1 + 126 * velocity), channel=self.channel))
+            timer = threading.Timer(self.duration, self._expire, (string,))
+            timer.daemon = True
+            self.sounding[string] = (midi_note, timer)
+            timer.start()
 
     def mute(self, string):
+        with self.lock:
+            self._off(string)
+
+    def _expire(self, string):
+        with self.lock:  # only if this timer's note is still the one sounding
+            if self.sounding[string] and self.sounding[string][1] is threading.current_thread():
+                self._off(string)
+
+    def _off(self, string):
+        """Caller holds the lock."""
         if self.sounding[string] is not None:
-            self.port.send(self.mido.Message("note_off", note=self.sounding[string], channel=self.channel))
+            note, timer = self.sounding[string]
+            timer.cancel()
+            self.port.send(self.mido.Message("note_off", note=note, channel=self.channel))
             self.sounding[string] = None
 
     def close(self):

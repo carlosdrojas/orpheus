@@ -21,7 +21,7 @@ curl -L -o models/hand_landmarker.task \
 ```
 
 Hold the board like a neck: marker 0 top-left (nut), 1 top-right, 2 bottom-right, 3 bottom-left.
-Left hand fingertips in the fret zone hold frets; right index finger crossing
+Right hand fingertips in the fret zone hold frets; left index finger crossing
 strings in the strum zone (right third of the board) plucks them.
 
 Keys: `s` skeleton, `l` swap fret/pick hands, `q` quit.

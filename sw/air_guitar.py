@@ -19,7 +19,7 @@ Options
   --midi         also send to a virtual MIDI port named "orpheus"
   --no-audio     don't run the built-in synth
   --log FILE     append events as JSON lines
-  --lefty        start with fretting = right hand
+  --lefty        start with fretting = left hand
 """
 
 import argparse
@@ -107,7 +107,7 @@ def main():
     if not cap.isOpened():
         raise SystemExit("Could not open webcam.")
 
-    fret_label = "Right" if args.lefty else "Left"
+    fret_label = "Left" if args.lefty else "Right"
     show_skeleton = False
     flash = [0.0] * NUM_STRINGS
     recent = []  # last few events for on-screen log
@@ -149,6 +149,9 @@ def main():
                 flash[ev.string] = now
                 for out in outputs:
                     out.pluck(ev.string, ev.note, ev.velocity)
+            elif ev.kind == "unfret":  # lifting the finger damps the string
+                for out in outputs:
+                    out.mute(ev.string)
             print(ev)
             if log:
                 log.write(json.dumps(ev.__dict__) + "\n")
