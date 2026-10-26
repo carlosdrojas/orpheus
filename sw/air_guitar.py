@@ -12,6 +12,7 @@ Without markers, a fixed rectangle in the middle of the frame is the board.
 
 Controls
   s  toggle skeleton overlay
+  d  toggle board diagnostics (marker IDs, fit quality, tracking %)
   l  swap which hand frets / picks (lefty mode)
   q  quit
 
@@ -20,19 +21,24 @@ Options
   --no-audio     don't run the built-in synth
   --log FILE     append events as JSON lines
   --lefty        start with fretting = left hand
+  --diag         start with diagnostics on
+  --layout FILE  board layout JSON from gen_board.py (default: board_layout.json if present,
+                 else the original 4 corner markers)
 """
 
 import argparse
 import json
 import time
+from collections import deque
 
 import cv2
 import numpy as np
 import mediapipe as mp
 from mediapipe.tasks.python import BaseOptions, vision
 
+import layout as layout_mod
 from board import Board
-from guitar import (FRET_ZONE, NUM_FRETS, NUM_STRINGS, OPEN_NOTES, GuitarState,
+from guitar import (FRET_ZONE, NUM_FRETS, STRUM_START, NUM_STRINGS, OPEN_NOTES, GuitarState,
                     fret_u, note_name, string_v)
 from hand_shapes import (INDEX_TIP, MIDDLE_TIP, MODEL_PATH, PINKY_TIP, RING_TIP,
                          draw_label, draw_skeleton, to_pixels)
@@ -61,7 +67,8 @@ def make_landmarker():
 
 def draw_board(frame, board, state, flash):
     """Strings, frets, strum zone, held cells and recently plucked strings."""
-    board.draw_quad(frame, FRET_ZONE, 0, 1, 1, (60, 60, 60), alpha=0.25)  # strum zone
+    board.draw_quad(frame, STRUM_START, 0, 1, 1, (60, 60, 60), alpha=0.25)  # strum zone
+    board.draw_quad(frame, FRET_ZONE, 0, STRUM_START, 1, (0, 0, 0), alpha=0.45)  # dead band
     for f in range(1, NUM_FRETS + 1):
         u = fret_u(f)
         board.draw_line(frame, (u, 0), (u, 1), COL_FRET)
@@ -82,6 +89,21 @@ def draw_board(frame, board, state, flash):
     board.draw_outline(frame)
 
 
+def draw_diag(frame, board, modes):
+    """Marker outlines/IDs plus fit stats, top right."""
+    board.draw_markers(frame)
+    total = len(board.known)
+    err = f"{board.reproj_err_cm:.2f}cm" if board.reproj_err_cm is not None else "-"
+    mpx = f"{board.marker_px:.0f}px" if board.marker_px else "-"
+    track = 100 * sum(m == "tracking" for m in modes) / max(len(modes), 1)
+    lines = [f"board: {board.mode}  ({track:.0f}% tracking, last {len(modes)} frames)",
+             f"markers {len(board.seen_ids)}/{total}: {sorted(board.seen_ids)}",
+             f"inliers {board.inliers}  reproj err {err}  marker size {mpx}"]
+    w = frame.shape[1]
+    for i, line in enumerate(lines):
+        draw_label(frame, line, (w - 470, 28 + 22 * i), 0.5, (0, 255, 120) if board.tracking else (0, 140, 255))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--midi", action="store_true")
@@ -89,6 +111,8 @@ def main():
     ap.add_argument("--log")
     ap.add_argument("--lefty", action="store_true")
     ap.add_argument("--camera", type=int, default=0)
+    ap.add_argument("--diag", action="store_true")
+    ap.add_argument("--layout")
     args = ap.parse_args()
 
     outputs = []
@@ -101,7 +125,9 @@ def main():
     log = open(args.log, "a") if args.log else None
 
     landmarker = make_landmarker()
-    board = Board()
+    layout_path = args.layout or (layout_mod.DEFAULT_PATH if layout_mod.DEFAULT_PATH.exists() else None)
+    board = Board(layout_mod.load(layout_path) if layout_path else None)
+    print(f"board layout: {layout_path or 'legacy 4 corner markers'}")
     state = GuitarState()
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -109,20 +135,36 @@ def main():
 
     fret_label = "Left" if args.lefty else "Right"
     show_skeleton = False
+    show_diag = args.diag
+    modes = deque(maxlen=150)               # recent board modes, for the rolling tracking %
+    mode_counts = {"tracking": 0, "hold": 0, "fallback": 0}
+    marker_px_seen = []
     flash = [0.0] * NUM_STRINGS
     recent = []  # last few events for on-screen log
     t0 = time.time()
     fps, last = 0.0, time.time()
 
+    failed_reads = 0
     while True:
         ok, frame = cap.read()
-        if not ok:
-            break
+        if not ok:  # cameras often drop the first reads while starting up
+            failed_reads += 1
+            if failed_reads > 60:
+                print(f"Camera {args.camera} stopped giving frames. Check camera permission for this "
+                      "terminal, or try another --camera index (virtual cameras like OBS give none).")
+                break
+            time.sleep(0.03)
+            continue
+        failed_reads = 0
         frame = cv2.flip(frame, 1)
         h, w = frame.shape[:2]
         now = time.time()
 
-        board.update(frame)
+        board.update(frame, mirrored=True)
+        modes.append(board.mode)
+        mode_counts[board.mode] += 1
+        if board.marker_px:
+            marker_px_seen.append(board.marker_px)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = landmarker.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb),
                                              int((now - t0) * 1000))
@@ -164,6 +206,8 @@ def main():
         fps = 0.9 * fps + 0.1 / max(now2 - last, 1e-6)
         last = now2
         draw_label(frame, f"fret hand: {fret_label}   fps: {fps:.0f}", (10, 28), 0.6)
+        if show_diag:
+            draw_diag(frame, board, modes)
         for i, line in enumerate(recent):
             draw_label(frame, line, (10, h - 12 - 20 * (len(recent) - 1 - i)), 0.45, (200, 200, 200))
 
@@ -173,8 +217,16 @@ def main():
             break
         elif key == ord("s"):
             show_skeleton = not show_skeleton
+        elif key == ord("d"):
+            show_diag = not show_diag
         elif key == ord("l"):
             fret_label = "Left" if fret_label == "Right" else "Right"
+
+    frames = sum(mode_counts.values())
+    if frames:
+        pct = "  ".join(f"{k} {100 * n / frames:.0f}%" for k, n in mode_counts.items())
+        mpx = f"{np.median(marker_px_seen):.0f}px" if marker_px_seen else "none seen"
+        print(f"board: {pct} | median marker {mpx} | {frames / (time.time() - t0):.1f} fps over {frames} frames")
 
     cap.release()
     cv2.destroyAllWindows()

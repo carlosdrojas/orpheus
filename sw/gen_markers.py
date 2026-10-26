@@ -16,7 +16,7 @@ import argparse
 import cv2
 import numpy as np
 
-from board import ARUCO_DICT, MARKER_IDS
+from layout import ARUCO_DICT, LEGACY_IDS as MARKER_IDS
 
 
 def main():

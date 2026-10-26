@@ -4,3 +4,4 @@ numpy
 sounddevice
 mido
 python-rtmidi
+pillow

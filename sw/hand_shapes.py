@@ -166,7 +166,10 @@ def draw_shape(frame, points, mode, color):
 
 
 def draw_label(frame, text, origin, scale=0.7, color=(255, 255, 255)):
-    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 4, cv2.LINE_AA)
+    # Outline from offset thin copies: a thick stroke widens glyph spacing, so it drifts off the text.
+    x, y = origin
+    for dx, dy in ((-2, 0), (2, 0), (0, -2), (0, 2), (-1, -1), (1, -1), (-1, 1), (1, 1)):
+        cv2.putText(frame, text, (x + dx, y + dy), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 1, cv2.LINE_AA)
     cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
 
 

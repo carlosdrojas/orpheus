@@ -6,8 +6,8 @@ Output:            a list of Event objects - this is the stream the mechanical
 
 Board layout (board space, see board.py):
 
-    u:  [0 ............ FRET_ZONE) [FRET_ZONE ....... 1]
-              fret cells                strum zone
+    u:  [0 ............ FRET_ZONE) [FRET_ZONE .. STRUM_START) [STRUM_START ... 1]
+              fret cells                  dead band              strum zone
     v:  six string lines at (i + 0.5) / 6, i = 0 (top) .. 5 (bottom)
 """
 
@@ -17,6 +17,7 @@ import time
 NUM_STRINGS = 6
 NUM_FRETS = 5          # frets represented on the board (keep small - it's a hand-held board)
 FRET_ZONE = 0.65       # fraction of the board length that is frets; the rest is strum zone
+STRUM_START = 0.72     # plucks only count past here; FRET_ZONE..STRUM_START is a dead band
 STRING_SLOP = 0.6      # how far from a string line (in string spacings) a fingertip still counts
 
 # Standard tuning, MIDI note numbers, top string first (low E .. high E)
@@ -47,6 +48,12 @@ class Event:
     note: int = 0        # MIDI note, for pluck
     direction: int = 0   # +1 down, -1 up, for pluck
     velocity: float = 0  # 0..1, for pluck
+
+    def __post_init__(self):
+        # Inputs arrive as numpy float32 from board.to_board; keep events plain so they serialize.
+        self.string, self.fret, self.note, self.direction = (
+            int(self.string), int(self.fret), int(self.note), int(self.direction))
+        self.t, self.velocity = float(self.t), float(self.velocity)
 
     def __str__(self):
         if self.kind == "pluck":
@@ -100,7 +107,7 @@ class GuitarState:
         Emits a pluck for every string line the tip crossed since last frame.
         """
         events = []
-        if tip is None or not (FRET_ZONE <= tip[0] <= 1.0) or not (-0.1 <= tip[1] <= 1.1):
+        if tip is None or not (STRUM_START <= tip[0] <= 1.0) or not (-0.1 <= tip[1] <= 1.1):
             self._pick_prev = None
             return events
 
